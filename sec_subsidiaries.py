@@ -1,191 +1,313 @@
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
-import time
 import logging
-from typing import Optional, List, Dict, Any
+import time
+import json
+from bs4 import BeautifulSoup
+import re
+from datetime import datetime
+import os
+from typing import List, Dict, Any
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('subsidiaries.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# SEC requires a valid user-agent
-HEADERS = {
-    'User-Agent': 'Your Name your.email@example.com'
-}
+# Constants for rate limiting
+REQUEST_DELAY = 0.5  # Delay between requests in seconds
+MAX_RETRIES = 3
+RATE_LIMIT_WAIT = 30  # Seconds to wait when rate limited
 
-def get_cik(ticker: str) -> Optional[str]:
-    """
-    Retrieves the CIK for a given ticker symbol from SEC-provided JSON file.
-    Note: This covers only major companies. You can skip this and enter CIK directly.
+# Create a session object with proper headers
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/json, text/html, */*',
+    'Accept-Encoding': 'gzip, deflate',
+    'Host': 'www.sec.gov',
+    'Connection': 'keep-alive'
+})
+
+def get_with_retry(url, method="GET", json=None, max_retries=3, initial_wait=1):
+    """Make an HTTP request with retry logic."""
+    headers = {
+        'User-Agent': 'Subsidiaries/1.0 (contact@example.com)',
+        'Accept': 'application/json, text/html, application/xml, */*',
+        'Accept-Encoding': 'gzip, deflate'
+    }
     
-    Args:
-        ticker (str): Stock ticker symbol
-        
-    Returns:
-        Optional[str]: CIK number if found, None otherwise
-    """
-    url = "https://www.sec.gov/files/company_tickers_exchange.json"
+    session = requests.Session()
+    session.headers.update(headers)
+    
+    for attempt in range(max_retries):
+        try:
+            time.sleep(0.1)  # Basic rate limiting
+            if method.upper() == "GET":
+                response = session.get(url)
+            else:
+                response = session.post(url, json=json)
+                
+            if response.status_code == 429:  # Rate limited
+                wait_time = initial_wait * (2 ** attempt)  # Exponential backoff
+                logging.warning(f"Rate limited, waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+                
+            if response.status_code == 403:  # Forbidden
+                wait_time = 10  # Fixed wait time for forbidden responses
+                logging.warning(f"Request forbidden, waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+                
+            return response
+            
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request failed: {str(e)}")
+            if attempt < max_retries - 1:
+                wait_time = initial_wait * (2 ** attempt)
+                logging.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logging.error("Max retries reached")
+                return None
+                
+    return None
+
+def get_cik(ticker):
+    """Get the CIK number for a company ticker."""
     try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
+        # Try to get CIK from the SEC's company lookup
+        url = f"https://www.sec.gov/cgi-bin/browse-edgar?CIK={ticker}&owner=exclude&action=getcompany&output=atom"
+        response = get_with_retry(url)
+        
+        if response and response.status_code == 200:
+            # Parse the XML response
+            soup = BeautifulSoup(response.text, 'xml')
+            
+            # Find the CIK in the company info
+            cik_tag = soup.find('cik')
+            if cik_tag:
+                cik = str(int(cik_tag.text)).zfill(10)
+                logging.info(f"Found CIK for {ticker}: {cik}")
+                return cik
+                
+        logging.warning(f"Could not find CIK for ticker: {ticker}")
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error getting CIK: {str(e)}")
+        return None
+
+def get_10k_accession(cik, year):
+    """Get the accession number for a company's 10-K filing for a specific year."""
+    try:
+        # Format CIK to 10 digits
+        cik = str(cik).zfill(10)
+        
+        # Construct the URL for the SEC submissions API
+        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        
+        # Make the request with retry logic
+        response = get_with_retry(url)
+        if not response:
+            return None
+            
+        # Parse the response
         data = response.json()
-        for item in data.values():
-            if item['ticker'].lower() == ticker.lower():
-                return str(item['cik_str']).zfill(10)
-        logger.warning(f"CIK not found for ticker: {ticker}")
+        filings = data.get('filings', {}).get('recent', {})
+        
+        # Get the list of forms and dates
+        forms = filings.get('form', [])
+        dates = filings.get('filingDate', [])
+        accessions = filings.get('accessionNumber', [])
+        
+        # Find the most recent 10-K filing for the specified year
+        for form, date, accession in zip(forms, dates, accessions):
+            if form == '10-K' and date.startswith(str(year)):
+                logging.info(f"Found 10-K for {year} with accession: {accession}")
+                return accession.replace('-', '')
+                
+        logging.warning(f"No 10-K filing found for {year}")
         return None
-    except requests.RequestException as e:
-        logger.error(f"Error fetching CIK: {e}")
+        
+    except Exception as e:
+        logging.error(f"Error getting 10-K accession: {str(e)}")
         return None
 
-def get_10k_accession(cik: str, year: int) -> Optional[str]:
-    """
-    Gets accession number for the 10-K filing made in the specified year.
-    
-    Args:
-        cik (str): Company CIK number
-        year (int): Year of filing
-        
-    Returns:
-        Optional[str]: Accession number if found, None otherwise
-    """
-    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+def get_exhibit_21_url(cik, accession):
+    """Get the URL for Exhibit 21 from a company's 10-K filing."""
     try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        filings = response.json().get("filings", {}).get("recent", {})
-        for i, form_type in enumerate(filings.get("form", [])):
-            filing_date = filings["filingDate"][i]
-            if form_type == "10-K" and filing_date.startswith(str(year)):
-                return filings["accessionNumber"][i].replace("-", "")
-        logger.warning(f"No 10-K found for CIK {cik} in year {year}")
+        # Format CIK and accession number
+        cik = str(cik).zfill(10)
+        accession = accession.replace('-', '')
+        
+        # Construct the URL for the filing detail page
+        url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/index.json"
+        
+        # Make the request with retry logic
+        response = get_with_retry(url)
+        if not response:
+            return None
+            
+        # Parse the response
+        data = response.json()
+        
+        # Find the Exhibit 21 file
+        for file in data.get('directory', {}).get('item', []):
+            if 'ex21' in file.get('name', '').lower():
+                return f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{file.get('name')}"
+                
         return None
-    except requests.RequestException as e:
-        logger.error(f"Error fetching 10-K accession: {e}")
+        
+    except Exception as e:
+        logging.error(f"Error getting Exhibit 21 URL: {str(e)}")
         return None
 
-def get_exhibit_21_url(cik: str, accession_number: str) -> Optional[str]:
-    """
-    Returns the URL of Exhibit 21 (subsidiaries list) if found.
-    
-    Args:
-        cik (str): Company CIK number
-        accession_number (str): Filing accession number
-        
-    Returns:
-        Optional[str]: URL of Exhibit 21 if found, None otherwise
-    """
-    filing_index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_number}/index.json"
+def parse_subsidiaries(url):
+    """Parse subsidiaries from Exhibit 21"""
     try:
-        response = requests.get(filing_index_url, headers=HEADERS)
-        response.raise_for_status()
-        for file in response.json().get("directory", {}).get("item", []):
-            name = file.get("name", "").lower()
-            if "21" in name and name.endswith(".htm"):
-                return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_number}/{file['name']}"
-        logger.warning(f"Exhibit 21 not found for CIK {cik} with accession {accession_number}")
-        return None
-    except requests.RequestException as e:
-        logger.error(f"Error fetching Exhibit 21 URL: {e}")
-        return None
+        response = get_with_retry(url)
+        if not response:
+            return []
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        subsidiaries = []
+        
+        # Try to find subsidiaries in tables
+        for table in soup.find_all('table'):
+            for row in table.find_all('tr'):
+                cells = row.find_all(['td', 'th'])
+                if cells:
+                    for cell in cells:
+                        text = cell.get_text().strip()
+                        if text and len(text) > 2:
+                            subsidiaries.append(text)
+                            
+        # If no subsidiaries found in tables, try parsing text
+        if not subsidiaries:
+            text = soup.get_text()
+            lines = text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line and len(line) > 2:
+                    # Look for common patterns in subsidiary listings
+                    if re.match(r'^[\s•]*[A-Z].*', line):
+                        subsidiaries.append(line)
+                        
+        return list(set(subsidiaries))  # Remove duplicates
+    except Exception as e:
+        logger.error(f"Error parsing subsidiaries: {str(e)}")
+        return []
 
-def parse_exhibit_21_table(url: str) -> Optional[List[Dict[str, str]]]:
-    """
-    Parses the Exhibit 21 HTML to extract subsidiary name and jurisdiction.
+def process_company(company_name, ticker):
+    """Process a single company"""
+    logger.info(f"Processing {company_name} ({ticker})")
+    results = []
     
-    Args:
-        url (str): URL of the Exhibit 21 HTML file
-        
-    Returns:
-        Optional[List[Dict[str, str]]]: List of dictionaries containing subsidiary data if found, None otherwise
-    """
     try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "html.parser")
-        tables = soup.find_all("table")
-        data = []
-        for table in tables:
-            rows = table.find_all("tr")
-            for row in rows:
-                cols = row.find_all(["td", "th"])
-                text = [col.get_text(strip=True) for col in cols]
-                if len(text) >= 2:
-                    data.append({
-                        "Name of Subsidiary": text[0],
-                        "Jurisdiction of Incorporation or Organization": text[1]
+        cik = get_cik(ticker)
+        if not cik:
+            logger.error(f"Could not find CIK for {company_name}")
+            return results
+            
+        # Process each year from 2018 to current
+        current_year = datetime.now().year
+        for year in range(2018, current_year + 1):
+            logger.info(f"Processing year {year}")
+            
+            accession = get_10k_accession(cik, year)
+            if not accession:
+                logger.warning(f"No 10-K filing found for {year}")
+                continue
+                
+            url = get_exhibit_21_url(cik, accession)
+            if not url:
+                logger.warning(f"No Exhibit 21 found for {year}")
+                continue
+                
+            subsidiaries = parse_subsidiaries(url)
+            if subsidiaries:
+                for subsidiary in subsidiaries:
+                    results.append({
+                        'company': company_name,
+                        'year': year,
+                        'subsidiary': subsidiary
                     })
-        return data if data else None
-    except requests.RequestException as e:
-        logger.error(f"Error parsing Exhibit 21 table: {e}")
-        return None
+                logger.info(f"Found {len(subsidiaries)} subsidiaries for {year}")
+                
+    except Exception as e:
+        logger.error(f"Error processing {company_name}: {str(e)}")
+        
+    return results
 
-def extract_subsidiaries_for_company(ticker: str, company_name: str) -> None:
-    """
-    Main runner function: builds Excel file with one sheet per year (2018–2024).
+def save_results(results: List[Dict[str, Any]], company_name: str) -> None:
+    """Save results to Excel with each year in a separate sheet"""
+    try:
+        # Create subsidiaries directory if it doesn't exist
+        os.makedirs('subsidiaries', exist_ok=True)
+        
+        # Sanitize company name for filename
+        safe_name = re.sub(r'[^\w\-_\. ]', '_', company_name)
+        filename = f'subsidiaries/{safe_name}.xlsx'
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(results)
+        
+        if not df.empty:
+            # Create Excel writer
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                # Group by year and save each year to a separate sheet
+                for year, year_data in df.groupby('year'):
+                    # Sort subsidiaries alphabetically
+                    year_data = year_data.sort_values('subsidiary')
+                    
+                    # Create sheet name (max 31 characters as per Excel limitation)
+                    sheet_name = f'{year}'
+                    if len(sheet_name) > 31:
+                        sheet_name = sheet_name[:31]
+                    
+                    # Save to sheet
+                    year_data.to_excel(writer, sheet_name=sheet_name, index=False)
+                    
+                    # Auto-adjust column widths
+                    worksheet = writer.sheets[sheet_name]
+                    for idx, col in enumerate(year_data.columns):
+                        max_length = max(
+                            year_data[col].astype(str).apply(len).max(),
+                            len(str(col))
+                        )
+                        worksheet.column_dimensions[chr(65 + idx)].width = min(max_length + 2, 50)
+            
+            logger.info(f"Saved {len(results)} subsidiaries to {filename}")
+        else:
+            logger.warning(f"No subsidiaries found for {company_name}")
+            
+    except Exception as e:
+        logger.error(f"Error saving results for {company_name}: {str(e)}")
+
+def main():
+    """Main function"""
+    print("Starting script...")
     
-    Args:
-        ticker (str): Stock ticker symbol
-        company_name (str): Company name for the output file
-    """
-    logger.info(f"Starting extraction for {company_name} ({ticker})")
+    # Read companies from CSV
+    companies_df = pd.read_csv('companies.csv')
+    total_companies = len(companies_df)
+    print(f"Found {total_companies} companies to process")
     
-    cik = get_cik(ticker)
-    if not cik:
-        logger.error(f"Could not find CIK for {ticker}. You can also hardcode it if known.")
-        return
-
-    output_file = f"{company_name.replace(' ', '_')}.xlsx"
-    writer = pd.ExcelWriter(output_file, engine="openpyxl")
-
-    for year in range(2018, 2025):
-        logger.info(f"Processing year {year}...")
-        accession = get_10k_accession(cik, year)
-
-        if not accession:
-            pd.DataFrame([{
-                "Year": year,
-                "Name of Subsidiary": "",
-                "Jurisdiction of Incorporation or Organization": "",
-                "Notes": "10-K filing not found"
-            }]).to_excel(writer, sheet_name=str(year), index=False)
-            continue
-
-        exhibit_url = get_exhibit_21_url(cik, accession)
-        if not exhibit_url:
-            pd.DataFrame([{
-                "Year": year,
-                "Name of Subsidiary": "",
-                "Jurisdiction of Incorporation or Organization": "",
-                "Notes": "Exhibit 21.01 not found"
-            }]).to_excel(writer, sheet_name=str(year), index=False)
-            continue
-
-        rows = parse_exhibit_21_table(exhibit_url)
-        if not rows:
-            pd.DataFrame([{
-                "Year": year,
-                "Name of Subsidiary": "",
-                "Jurisdiction of Incorporation or Organization": "",
-                "Notes": "Exhibit 21 found but data could not be extracted"
-            }]).to_excel(writer, sheet_name=str(year), index=False)
-            continue
-
-        df = pd.DataFrame(rows)
-        df["Year"] = year
-        df["Notes"] = ""
-        df = df[["Year", "Name of Subsidiary", "Jurisdiction of Incorporation or Organization", "Notes"]]
-        df.to_excel(writer, sheet_name=str(year), index=False)
-
-        time.sleep(1)  # Respect SEC rate limit
-
-    writer.close()
-    logger.info(f"✅ Excel file saved as {output_file}")
+    # Process each company
+    for index, row in companies_df.iterrows():
+        print(f"\nProcessing company {index + 1}/{total_companies}: {row['company_name']}")
+        results = process_company(row['company_name'], row['ticker'])
+        save_results(results, row['company_name'])
+        print(f"Completed processing {row['company_name']}")
+        time.sleep(1)  # Add delay between companies
 
 if __name__ == "__main__":
-    # Example usage
-    extract_subsidiaries_for_company("EMN", "EASTMAN CHEMICAL CO") 
+    main() 
